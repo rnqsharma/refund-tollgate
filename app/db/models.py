@@ -2,11 +2,13 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import Enum, ForeignKey, Index, Numeric, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import Enum, ForeignKey, Index, Numeric, String, Text, UniqueConstraint, Uuid, Integer, text, JSON
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from app.domain.enums import ReturnStatus
+from app.domain.enums import ReturnStatus, StepStatus
 
+JsonType = JSON().with_variant(JSONB(), "postgresql")
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -74,4 +76,55 @@ class ReturnRequest(Base):
         # The database, not application code, is what makes idempotency safe under concurrency.
         UniqueConstraint("customer_id", "idempotency_key", name="uq_returns_customer_idem"),
         Index("ix_returns_status_created", "status", "created_at"),
+    )
+
+
+class RunStep(Base):
+    """One execution of one pipeline stage for one return.
+
+    This table is the pipeline's checkpoint: a stage with a SUCCEEDED row is never re-run, so a
+    crashed run resumes at the first stage without one. It is also the audit/replay record, so
+    LLM stages will fill in the model, prompt and token columns (they stay NULL for
+    deterministic stages).
+    """
+
+    __tablename__ = "run_steps"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
+    return_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("returns.id"), index=True)
+    stage: Mapped[str] = mapped_column(String(64))
+    status: Mapped[StepStatus] = mapped_column(
+        Enum(
+            StepStatus,
+            native_enum=False,
+            length=16,
+            values_callable=lambda e: [m.value for m in e],
+        )
+    )
+    # Hash of the stage's input, so a replay can tell whether the input changed.
+    input_hash: Mapped[str] = mapped_column(String(64))
+    output_json: Mapped[dict | None] = mapped_column(JsonType, default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+
+    model: Mapped[str | None] = mapped_column(String(100), default=None)
+    prompt_version: Mapped[str | None] = mapped_column(String(64), default=None)
+    tokens_in: Mapped[int | None] = mapped_column(Integer, default=None)
+    tokens_out: Mapped[int | None] = mapped_column(Integer, default=None)
+
+    started_at: Mapped[datetime] = mapped_column(default=_now)
+    finished_at: Mapped[datetime] = mapped_column(default=_now)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (
+        # At most one SUCCEEDED row per stage per return, enforced by the database. Failed
+        # attempts may repeat. This is what makes a duplicate or racing worker harmless: the
+        # second one to finish a stage hits this index instead of writing a second result.
+        Index(
+            "uq_run_steps_one_success",
+            "return_id",
+            "stage",
+            unique=True,
+            postgresql_where=text("status = 'succeeded'"),
+            sqlite_where=text("status = 'succeeded'"),
+        ),
     )

@@ -22,3 +22,9 @@ FINAL_STATUSES = frozenset(
         ReturnStatus.DENIED,
     }
 )
+
+class StepStatus(StrEnum):
+    """Outcome of one execution of one pipeline stage."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
